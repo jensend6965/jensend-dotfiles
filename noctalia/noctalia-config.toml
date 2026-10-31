@@ -1,35 +1,66 @@
-[bar.default]
-background_opacity = 0.84999998100101948
-capsule_radius = 5
-center = [
-    "indicator",
-    "divider-left",
-    "summary",
-    "divider-left",
-    "workspaces",
-    "divider-right",
-    "wallpaper",
-    "recorder",
-    "clipboard",
-    "volume",
-    "network",
-    "divider-right",
-    "tray"
-]
-concave_edge_corners = false
-end = [ "notifications", "clock" ]
-font_family = "Maple Mono NF"
-margin_ends = 762
-radius_top_left = 0
-radius_top_right = 0
-start = [ "active_window", "audio_visualizer" ]
-widget_spacing = 10
+[bar]
+order = [ "default" ]
+
+    [bar.default]
+    background_opacity = 0.84999998100101948
+    capsule_radius = 5
+    center = [
+        "audio_visualizer",
+        "clock",
+        "divider-left",
+        "tray",
+        "divider-left",
+        "summary",
+        "divider-left",
+        "taskbar",
+        "divider-right",
+        "indicator",
+        "divider-right",
+        "media",
+        "divider-right",
+        "active_window",
+        "audio_visualizer"
+    ]
+    concave_edge_corners = false
+    end = []
+    font_family = "JetBrainsMono NF"
+    margin_ends = 700
+    radius_top_left = 0
+    radius_top_right = 0
+    start = []
+    widget_spacing = 10
+
+[[control_center.shortcuts]]
+type = "power_profile"
+
+[[control_center.shortcuts]]
+type = "noctalia/screen_recorder:toggle"
+
+[[control_center.shortcuts]]
+type = "weather"
+
+[[control_center.shortcuts]]
+type = "audio"
+
+[[control_center.shortcuts]]
+type = "mic_mute"
+
+[[control_center.shortcuts]]
+type = "clipboard"
+
+[desktop_widgets]
+enabled = false
 
 [dock]
 background_opacity = 0.84999998100101948
 concave_edge_corners = false
-enabled = true
+cross_axis_padding = 4
+enabled = false
+icon_size = 44
+inactive_opacity = 0.9499999787658453
 launcher_position = "start"
+magnification_scale = 1.5000000074505806
+main_axis_padding = 10
 pinned = [ "thunar", "firefox", "equibop", "steam", "spotify-launcher", "dev.zed.Zed" ]
 radius_bottom_left = 0
 radius_bottom_right = 0
@@ -104,16 +135,34 @@ widget_order = [ "lockscreen-login-box@Virtual-virtual-xdp-kde-discord", "locksc
 
 [notification]
 background_opacity = 0.84999998100101948
+position = "top_center"
 
 [osd]
 background_opacity = 0.84999998100101948
 
+[plugin_settings."zumik3-del/opencode-go-usage"]
+api_key = "oc_sk_e75ad4261c3e_VTCMO7B1wT1jfBprYk8cFUN7xqC6aA2o"
+panel_placement = "floating"
+
 [plugins]
-enabled = [ "theblackdon/kineticwe-layouts", "noctalia/screen_recorder", "tmelik/system-monitor", "joshuaslate/shelly" ]
+enabled = [ "theblackdon/kineticwe-layouts", "noctalia/screen_recorder", "tmelik/system-monitor" ]
 
 [shell]
-font_family = "Maple Mono NF"
+font_family = "JetBrainsMono NF"
 polkit_agent = true
+
+    [shell.launcher]
+    categories = false
+    layout = "simple"
+    pinned = [
+        "dev.kineticwe.Settings",
+        "io.github.jensend6965.Embr",
+        "spotify-launcher",
+        "discord",
+        "firefox",
+        "com.nousresearch.hermes",
+        "feishin"
+    ]
 
     [shell.panel]
     control_center_placement = "floating"
@@ -121,53 +170,69 @@ polkit_agent = true
     transparency_mode = "soft"
     wallpaper_placement = "floating"
 
+    [shell.window_switcher]
+    mru = true
+
 [theme]
-builtin = "Catppuccin"
+builtin = "Tokyo-Night"
 community_palette = "Catppuccin Frappe Blue"
 mode = "dark"
 source = "builtin"
+wallpaper_scheme = "m3-content"
 
     [theme.templates]
     builtin_ids = [ "alacritty", "btop", "gtk3", "gtk4", "kcolorscheme", "kineticwe", "kitty", "qt" ]
     community_ids = [ "brave-origin", "pywalfox" ]
 
 [wallpaper.default]
-path = "/home/jensend/Pictures/maligne-lake-from-spirit-island-jasper-national-park-backiee-4K.jpg"
+path = "/home/jensend/Pictures/1354305.jpeg"
 
 [wallpaper.last]
-path = "/home/jensend/Pictures/maligne-lake-from-spirit-island-jasper-national-park-backiee-4K.jpg"
+path = "/home/jensend/Pictures/1354305.jpeg"
 
 [wallpaper.monitors.DP-2]
-path = "/home/jensend/Pictures/maligne-lake-from-spirit-island-jasper-national-park-backiee-4K.jpg"
+path = "/home/jensend/Pictures/1354305.jpeg"
 
 [widget.active_window]
 display = "text_only"
-max_length = 100
+max_length = 80
+show_empty_label = true
 title_scroll = "on_hover"
 
 [widget.audio_visualizer]
-centered = false
-mirrored = false
+bands = 10
+capsule_fill = "on_surface_variant"
+capsule_opacity = 0.14999999999999999
+capsule_radius = "auto"
+centered = true
+mirrored = true
 
 [widget.clock]
-format = "{:%H:%M, %d.%m.%y}"
+format = "{:%H:%M}"
 
 [widget.divider-left]
+color = "#BDBDBD"
+interactive = false
 text = "\\"
 type = "text"
 
 [widget.divider-right]
+color = "#BDBDBD"
+interactive = false
 text = "/"
 type = "text"
 
 [widget.indicator]
 type = "theblackdon/kineticwe-layouts:indicator"
 
+[widget.media]
+max_length = 80
+
 [widget.network]
 show_label = false
 
 [widget.notifications]
-hide_when_no_unread = true
+hide_when_no_unread = false
 
 [widget.recorder]
 type = "noctalia/screen_recorder:recorder"
@@ -185,15 +250,26 @@ show_swap = false
 show_upload = false
 type = "tmelik/system-monitor:summary"
 
+[widget.taskbar]
+anchor = true
+group_by_workspace = true
+group_single_icon_per_app = true
+hide_empty_workspaces = true
+minimal = true
+show_all_outputs = true
+workspace_label_placement = "inside"
+
 [widget.tray]
 detached_panel = true
 drawer = true
 match_adjacent_spacing = true
-pinned = [ "Fcitx", "Discord", "equibop" ]
+pinned = [ "Fcitx", "Discord", "embr", "equibop" ]
 
 [widget.volume]
 show_label = false
 
 [widget.workspaces]
-anchor = true
-style = "minimal"
+anchor = false
+empty_color = "shadow"
+occupied_color = "surface_variant"
+style = "regular"
