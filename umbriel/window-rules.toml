@@ -46,7 +46,7 @@ blur = true
 
 [[window_rule]]
 match.is_focused = true
-opacity = 0.98
+opacity = 0.95
 blur = true
 
 # Keep an application drawing while it is hidden on another workspace, for programs whose other work stalls without it.

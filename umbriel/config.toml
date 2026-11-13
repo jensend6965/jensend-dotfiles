@@ -24,7 +24,14 @@ files = ["noctalia.toml"]
 # https://docs.noctalia.dev/umbriel/configuration/#general
 #
 [general]
-autostart = ["noctalia", "kitty", "steam", "feishin", "com.discordapp.Discord", "embr"]
+autostart = [
+  "noctalia",
+  "kitty",
+  "fcitx5",
+  "steam",
+  "flatpak run com.discordapp.Discord",
+  "flatpak run org.jeffvli.feishin",
+]
 xwayland = true
 # Sharp X11 apps and games on scaled outputs; they see physical resolutions.
 xwayland_native_resolution = true
@@ -43,7 +50,7 @@ focus_on_activate = true
 # ==============================================================================
 # Lid events
 # Remove the laptop panel from the desktop while the lid is closed, then
-# restore it when the lid opens. Replace eDP-1 with the name from
+# restore sit when the lid opens. Replace eDP-1 with the name from
 # `umbriel outputs`.
 # https://docs.noctalia.dev/umbriel/configuration/#events
 #
@@ -84,14 +91,6 @@ workspaces = ["main", "chill", "game"]
 # vrr = "fullscreen"
 # hdr = "auto"
 # sdr_transfer = "gamma22" # Or "srgb" for piecewise SDR decoding in HDR.
-
-# ==============================================================================
-# Appearance
-# Blur uses a smaller radius than the built-in default.
-# https://docs.noctalia.dev/umbriel/appearance/
-#
-[appearance.blur]
-radius = 3
 
 # Optional title bar with modifier-free dragging and floating frame resizing.
 # [appearance.title_bar]
@@ -164,7 +163,7 @@ radius = 3
 numlock_toggle = true
 
 [input.cursor]
-theme = "capitaine-cursors"
+theme = "Bibata-Modern-Ice"
 size = 32
 
 # Focus can follow the pointer across tiled, floating, and pinned windows.

@@ -11,8 +11,8 @@
 "Alt+Tab" = "spawn noctalia msg window-switcher hold all"
 "Mod+Shift+S" = "spawn noctalia msg screenshot-region"
 "Mod+T" = { action = "spawn kitty", repeat = false }
-"Mod+E" = { action = "spawn thunar", repeat = false }
-"Mod+B" = { action = "spawn zen-browser", repeat = false }
+"Mod+E" = { action = "spawn nautilus", repeat = false }
+"Mod+B" = { action = "spawn zen", repeat = false }
 "Mod+Q" = { action = "window-close", repeat = false }
 "Mod+Escape" = "session-quit"
 "Mod+Shift+Escape" = { action = "shortcuts-inhibit-toggle", allow_when_inhibited = true, repeat = false }

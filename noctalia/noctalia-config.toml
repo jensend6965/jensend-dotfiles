@@ -91,7 +91,7 @@ widget_order = [ "lockscreen-login-box@Virtual-virtual-xdp-kde-discord", "locksc
     type = "login_box"
 
         [lockscreen_widgets.widget."lockscreen-login-box@DP-2".settings]
-        background_color = "surface_variant"
+        background_color = "surface_container"
         background_opacity = 0.88
         background_radius = 12.0
         center_password_text = false
@@ -118,7 +118,7 @@ widget_order = [ "lockscreen-login-box@Virtual-virtual-xdp-kde-discord", "locksc
     type = "login_box"
 
         [lockscreen_widgets.widget."lockscreen-login-box@Virtual-virtual-xdp-kde-discord".settings]
-        background_color = "surface_variant"
+        background_color = "surface_container"
         background_opacity = 0.88
         background_radius = 12.0
         center_password_text = false
@@ -139,13 +139,6 @@ position = "top_center"
 
 [osd]
 background_opacity = 0.84999998100101948
-
-[plugin_settings."zumik3-del/opencode-go-usage"]
-api_key = "oc_sk_e75ad4261c3e_VTCMO7B1wT1jfBprYk8cFUN7xqC6aA2o"
-panel_placement = "floating"
-
-[plugins]
-enabled = [ "theblackdon/kineticwe-layouts", "noctalia/screen_recorder", "tmelik/system-monitor" ]
 
 [shell]
 font_family = "JetBrainsMono NF"
@@ -222,9 +215,6 @@ interactive = false
 text = "/"
 type = "text"
 
-[widget.indicator]
-type = "theblackdon/kineticwe-layouts:indicator"
-
 [widget.media]
 max_length = 80
 
@@ -271,5 +261,5 @@ show_label = false
 [widget.workspaces]
 anchor = false
 empty_color = "shadow"
-occupied_color = "surface_variant"
+occupied_color = "surface_container"
 style = "regular"
