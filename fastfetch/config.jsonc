@@ -1,0 +1,106 @@
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": {
+    "type": "small",
+    "color": {
+      "1": "#7dcfff",
+      "2": "#bb9af7"
+    },
+    "padding": {
+      "top": 1
+    }
+  },
+  "display": {
+    "separator": " ",
+    "color": {
+      "keys": "#7dcfff",
+      "title": "#bb9af7"
+    },
+    "percent": {
+      "type": 1,
+      "color": {
+        "green": "#9ece6a",
+        "yellow": "#e0af68",
+        "red": "#f7768e"
+      }
+    }
+  },
+  "modules": [
+    {
+      "type": "custom",
+      "key": "╭──────────────╮"
+    },
+    {
+      "type": "title",
+      "key": "│ {#31} user       {#keys}│",
+      "format": "{user-name}"
+    },
+    {
+      "type": "title",
+      "key": "│ {#32}󰇅 host       {#keys}│",
+      "format": "{host-name}"
+    },
+    {
+      "type": "os",
+      "key": "│ {#31}󰣇 os         {#keys}│"
+    },
+    {
+      "type": "host",
+      "key": "│ {#32}󰌢 host    {#keys}│"
+    },
+    {
+      "type": "kernel",
+      "key": "│ {#33}󰒋 kernel     {#keys}│"
+    },
+    {
+      "type": "uptime",
+      "key": "│ {#34}󰅐 uptime     {#keys}│"
+    },
+    {
+      "type": "packages",
+      "key": "│ {#35}󰏖 packages   {#keys}│"
+    },
+    {
+      "type": "shell",
+      "key": "│ {#36}󰆍 shell      {#keys}│"
+    },
+    {
+      "type": "display",
+      "key": "│ {#31}󰍹 display    {#keys}│"
+    },
+    {
+      "type": "de",
+      "key": "│ {#32}󰧨 desktop    {#keys}│"
+    },
+    {
+      "type": "cpu",
+      "key": "│ {#33}󰻠 cpu        {#keys}│"
+    },
+    {
+      "type": "gpu",
+      "key": "│ {#34}󰢮 gpu        {#keys}│"
+    },
+    {
+      "type": "memory",
+      "key": "│ {#35} memory     {#keys}│"
+    },
+    {
+      "type": "disk",
+      "key": "│ {#36}󰉉 disk       {#keys}│",
+      "folders": "/"
+    },
+    {
+      "type": "custom",
+      "key": "├──────────────┤"
+    },
+    {
+      "type": "colors",
+      "key": "│ {#39} colors     {#keys}│",
+      "symbol": "circle"
+    },
+    {
+      "type": "custom",
+      "key": "╰──────────────╯"
+    }
+  ]
+}
