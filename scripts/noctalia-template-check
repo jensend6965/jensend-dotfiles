@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""Scan Noctalia theme templates, verify the apps, and offer targeted fixes.
+
+For every template enabled in the live Noctalia config the script:
+
+  1. finds the template definition (built-in, community or user),
+  2. detects the target application as native, Flatpak, or neither,
+  3. checks that the rendered files and the app-side integration are correct,
+  4. proposes fixes and, with --fix / --fix-all, applies the safe ones.
+
+Noctalia does not symlink theme files. Templates render real files and then
+either edit an app config (include/import) or merge JSON, so most fixes mean
+re-running the template hooks or toggling one app setting. Only a few problems
+(app never started, missing package) need a manual one-time step.
+
+Usage:
+    noctalia-template-check            # scan and list proposed fixes
+    noctalia-template-check --fix      # choose fixes interactively
+    noctalia-template-check --fix-all  # apply every safe fix
+    noctalia-template-check --apply    # just re-render templates, then scan
+
+Exit status: 0 = no failures, 1 = failures remain, 2 = cannot scan.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+XDG_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+
+NOCTALIA_CONFIG_DIR = XDG_CONFIG / "noctalia"
+NOCTALIA_STATE_DIR = XDG_STATE / "noctalia"
+COMMUNITY_DIR = NOCTALIA_STATE_DIR / "community-templates"
+
+XDG_TOKENS = {
+    "$XDG_CONFIG_HOME": XDG_CONFIG,
+    "$XDG_STATE_HOME": XDG_STATE,
+    "$XDG_CACHE_HOME": XDG_CACHE,
+    "$XDG_DATA_HOME": XDG_DATA,
+}
+
+FLATPAK_RE = re.compile(r"/\.var/app/([A-Za-z0-9_.-]+)/")
+HEX_RE = re.compile(r"#[0-9a-fA-F]{6,8}\b")
+RGB_RE = re.compile(r"\b\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\b")  # KDE .colors triples
+PLACEHOLDER_RE = re.compile(r"\{\{.*?\}\}|<\*", re.DOTALL)
+
+OK = "ok"
+WARN = "warn"
+FAIL = "fail"
+SKIP = "skip"
+RANK = {OK: 0, SKIP: 0, WARN: 1, FAIL: 2}
+
+# Templates that theme a toolkit or a desktop-wide setting, not one app.
+SYSTEM_GROUPS = {"gtk3", "gtk4", "kcolorscheme"}
+
+APP_BINARIES = {
+    "kitty": ["kitty"],
+    "alacritty": ["alacritty"],
+    "btop": ["btop"],
+    "qt": ["qt5ct", "qt6ct"],
+    "umbriel": ["umbriel"],
+    "feishin": ["feishin"],
+    "zen-browser": ["zen", "zen-browser"],
+    "fastfetch": ["fastfetch"],
+    "luciole": ["luciole"],
+    "foot": ["foot"],
+    "ghostty": ["ghostty"],
+    "wezterm": ["wezterm"],
+    "helix": ["hx", "helix"],
+    "emacs": ["emacs"],
+    "niri": ["niri"],
+    "hyprland": ["Hyprland", "hyprland"],
+    "sway": ["sway"],
+    "labwc": ["labwc"],
+    "mango": ["mango"],
+    "scroll": ["scroll"],
+    "cava": ["cava"],
+}
+APP_FLATPAKS = {
+    "feishin": ["org.jeffvli.feishin"],
+    "zen-browser": ["app.zen_browser.zen"],
+    "luciole": ["dev.noctalia.luciole"],
+}
+
+
+@dataclass
+class Fix:
+    key: str
+    label: str
+    kind: str  # "auto" (safe), "optional" (offered, not in --fix-all), "manual"
+    action: Callable[[], tuple[bool, str]] | None = None
+    instructions: str | None = None
+
+
+@dataclass
+class Finding:
+    status: str
+    message: str
+    fix: Fix | None = None
+
+
+@dataclass
+class Entry:
+    group: str
+    origin: str  # builtin | community | user
+    key: str
+    data: dict
+    base: Path
+
+
+@dataclass
+class Installed:
+    natives: list[str] | None = None  # None = system/unknown template
+    flatpaks: list[str] | None = None
+
+    @property
+    def known(self) -> bool:
+        return self.natives is not None or self.flatpaks is not None
+
+
+@dataclass
+class GroupResult:
+    group: str
+    origin: str
+    findings: list[Finding] = field(default_factory=list)
+    names: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        if not self.findings:
+            return SKIP
+        return max(self.findings, key=lambda item: RANK[item.status]).status
+
+
+# ---------------------------------------------------------------------------
+# paths and config
+
+
+def display(path: Path) -> str:
+    text = str(path)
+    home = str(HOME)
+    if text == home:
+        return "~"
+    if text.startswith(home + "/"):
+        return "~/" + text[len(home) + 1 :]
+    return text
+
+
+def expand(value: str, base: Path) -> Path:
+    text = str(value)
+    for token, path in XDG_TOKENS.items():
+        text = text.replace(token, str(path))
+    if text == "~" or text.startswith("~/"):
+        text = os.path.expanduser(text)
+    path = Path(text)
+    return path if path.is_absolute() else base / path
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def active_lines(path: Path):
+    """Yield lines that are not blank and not a whole-line comment."""
+    for line in read_text(path).splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("//"):
+            yield stripped
+
+
+def deep_merge(base: dict, extra: dict) -> dict:
+    merged = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def find_builtin_dir() -> Path | None:
+    candidates: list[Path] = [
+        Path("/usr/share/noctalia/assets/templates"),
+        Path("/usr/local/share/noctalia/assets/templates"),
+    ]
+    exe = shutil.which("noctalia")
+    if exe:
+        candidates.append(Path(exe).resolve().parent.parent / "share/noctalia/assets/templates")
+    for data_dir in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if data_dir:
+            candidates.append(Path(data_dir) / "noctalia/assets/templates")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if (candidate / "builtin.toml").is_file():
+            return candidate
+    return None
+
+
+def load_templates() -> tuple[dict, str]:
+    """Return the effective [theme.templates] table and where it came from."""
+    exe = shutil.which("noctalia")
+    if exe:
+        try:
+            proc = subprocess.run(
+                [exe, "msg", "config-get", "theme.templates"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return tomllib.loads(proc.stdout), "running Noctalia"
+        except (OSError, subprocess.SubprocessError, tomllib.TOMLDecodeError):
+            pass
+
+    merged: dict = {}
+    for path in (
+        NOCTALIA_STATE_DIR / "settings.toml",
+        NOCTALIA_CONFIG_DIR / "noctalia-config.toml",
+        NOCTALIA_CONFIG_DIR / "config.toml",
+    ):
+        try:
+            document = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        merged = deep_merge(merged, document.get("theme", {}).get("templates", {}))
+    return merged, "config files"
+
+
+def build_entries(templates: dict) -> tuple[list[Entry], list[Finding]]:
+    entries: list[Entry] = []
+    notices: list[Finding] = []
+
+    if templates.get("enable_builtin_templates", True):
+        builtin_dir = find_builtin_dir()
+        catalog: dict = {}
+        if builtin_dir is None:
+            notices.append(Finding(FAIL, "built-in template catalog not found in the installed Noctalia"))
+        else:
+            try:
+                document = tomllib.loads((builtin_dir / "builtin.toml").read_text(encoding="utf-8"))
+                catalog = document.get("templates", {})
+            except (OSError, tomllib.TOMLDecodeError) as error:
+                notices.append(Finding(FAIL, f"cannot read builtin.toml: {error}"))
+        for template_id in templates.get("builtin_ids") or []:
+            data = catalog.get(template_id)
+            if not isinstance(data, dict):
+                notices.append(Finding(FAIL, f"{template_id}: no definition in the installed built-in catalog"))
+                continue
+            entries.append(Entry(template_id, "builtin", template_id, data, builtin_dir))
+
+    if templates.get("enable_community_templates", True):
+        for template_id in templates.get("community_ids") or []:
+            directory = COMMUNITY_DIR / template_id
+            try:
+                document = tomllib.loads((directory / "template.toml").read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError) as error:
+                notices.append(Finding(FAIL, f"{template_id}: cannot read community template.toml ({error})"))
+                continue
+            for key, data in (document.get("templates") or {}).items():
+                if isinstance(data, dict):
+                    entries.append(Entry(template_id, "community", key, data, directory))
+
+    for template_id, data in (templates.get("user") or {}).items():
+        if not isinstance(data, dict) or data.get("enabled", True) is False:
+            continue
+        entries.append(Entry(template_id, "user", template_id, data, NOCTALIA_CONFIG_DIR))
+
+    return entries, notices
+
+
+# ---------------------------------------------------------------------------
+# installation detection
+
+
+_flatpak_cache: dict[str, bool] = {}
+
+
+def flatpak_installed(app_id: str) -> bool:
+    if app_id not in _flatpak_cache:
+        exe = shutil.which("flatpak")
+        if exe is None:
+            _flatpak_cache[app_id] = False
+        else:
+            proc = subprocess.run([exe, "info", app_id], capture_output=True, text=True)
+            _flatpak_cache[app_id] = proc.returncode == 0
+    return _flatpak_cache[app_id]
+
+
+def output_paths(entry: Entry) -> list[str]:
+    outputs = entry.data.get("output_path")
+    if isinstance(outputs, str):
+        return [outputs]
+    if isinstance(outputs, list):
+        return [str(item) for item in outputs]
+    return []
+
+
+def detect_installed(group: str, entries: list[Entry]) -> Installed:
+    if group in SYSTEM_GROUPS:
+        return Installed(None, None)
+
+    native_names = APP_BINARIES.get(group)
+    natives = [name for name in native_names or [] if shutil.which(name)] if native_names else None
+
+    flatpak_ids = set(APP_FLATPAKS.get(group, []))
+    for entry in entries:
+        for output in output_paths(entry):
+            match = FLATPAK_RE.search(str(expand(output, NOCTALIA_CONFIG_DIR)))
+            if match:
+                flatpak_ids.add(match.group(1))
+
+    known = native_names is not None or bool(flatpak_ids)
+    if not known:
+        return Installed(None, None)
+
+    flatpaks = sorted(app_id for app_id in flatpak_ids if flatpak_installed(app_id))
+    return Installed(natives if native_names is not None else [], flatpaks)
+
+
+def installation_finding(installed: Installed, templates: dict, group: str, origin: str) -> Finding:
+    if group in SYSTEM_GROUPS:
+        return Finding(OK, "system template (no application install needed)")
+    if not installed.known:
+        return Finding(SKIP, "app install not detected for this template")
+
+    parts: list[str] = []
+    if installed.natives:
+        parts.append("native (" + ", ".join(installed.natives) + ")")
+    if installed.flatpaks:
+        parts.append("Flatpak (" + ", ".join(installed.flatpaks) + ")")
+
+    if parts:
+        return Finding(OK, "installed: " + "; ".join(parts))
+
+    fix = Fix(
+        key=f"disable-{origin}-{group}",
+        label=f"Disable the {group} template (no native or Flatpak install found)",
+        kind="optional",
+        action=lambda: disable_template(templates, origin, group),
+    )
+    return Finding(WARN, "not installed natively or as Flatpak; the rendered theme is unused", fix)
+
+
+# ---------------------------------------------------------------------------
+# fixes
+
+
+def toml_array(items: list[str]) -> str:
+    return "[ " + ", ".join(json.dumps(item) for item in items) + " ]"
+
+
+def run_templates_apply(quiet: bool = False) -> tuple[bool, str]:
+    exe = shutil.which("noctalia")
+    if exe is None:
+        return False, "noctalia is not in PATH"
+    proc = subprocess.run([exe, "msg", "templates-apply"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return False, f"templates-apply failed: {detail}"
+    if not quiet:
+        time.sleep(1.0)
+    return True, "templates re-applied"
+
+
+def apply_templates_fix(reason: str | None = None) -> Fix:
+    label = "Re-apply Noctalia templates"
+    if reason:
+        label += f" ({reason})"
+    return Fix("apply-templates", label, "auto", action=lambda: run_templates_apply())
+
+
+def disable_template(templates: dict, origin: str, group: str) -> tuple[bool, str]:
+    exe = shutil.which("noctalia")
+    if exe is None:
+        return False, "noctalia is not in PATH"
+    # Re-read the live lists: several disable fixes may run in one batch, and a
+    # snapshot taken at scan time would make the last one re-add the earlier IDs.
+    current_templates, _ = load_templates()
+    if origin == "user":
+        path = f"theme.templates.user.{group}.enabled"
+        value = "false"
+    else:
+        key = "builtin_ids" if origin == "builtin" else "community_ids"
+        current = [str(item) for item in current_templates.get(key) or []]
+        path = f"theme.templates.{key}"
+        value = toml_array([item for item in current if item != group])
+    proc = subprocess.run([exe, "msg", "config-set", path, value], capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return False, f"config-set failed: {detail}"
+    return True, f"disabled the {group} {origin} template"
+
+
+def btop_fix() -> tuple[bool, str]:
+    config = XDG_CONFIG / "btop/btop.conf"
+    if config.exists():
+        return False, f"{display(config)} already exists; re-apply templates instead"
+    exe = shutil.which("btop")
+    if exe is None:
+        return False, "btop is not installed"
+    proc = subprocess.run([exe, "--default-config"], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0 or not proc.stdout:
+        return False, "btop --default-config produced no output"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(proc.stdout, encoding="utf-8")
+    ok, message = run_templates_apply()
+    return ok, f"created {display(config)}; {message}"
+
+
+def feishin_fix(config: Path) -> tuple[bool, str]:
+    running = subprocess.run(["pgrep", "-f", "feishin"], capture_output=True, text=True)
+    if running.returncode == 0:
+        return False, "close Feishin first; it rewrites config.json on exit"
+    try:
+        data = json.loads(read_text(config))
+    except json.JSONDecodeError:
+        return False, f"{display(config)} is not valid JSON"
+    css = data.get("css")
+    if not isinstance(css, dict):
+        css = {}
+        data["css"] = css
+    css["enabled"] = True
+    backup = config.with_name(config.name + ".bak-noctalia-check")
+    shutil.copy2(config, backup)
+    config.write_text(json.dumps(data, indent="\t") + "\n", encoding="utf-8")
+    return True, f"enabled Custom CSS in {display(config)} (backup: {display(backup)})"
+
+
+# ---------------------------------------------------------------------------
+# checks
+
+
+def output_kind(path: Path) -> str:
+    if FLATPAK_RE.search(str(path)):
+        return "flatpak"
+    if path.is_relative_to(XDG_CACHE):
+        return "cache"
+    return "native"
+
+
+def check_output(path: Path) -> list[Finding]:
+    kind = output_kind(path)
+    label = f"{kind} output {display(path)}"
+
+    if not path.exists():
+        return [Finding(FAIL, f"{label} is missing", apply_templates_fix("render output"))]
+    if path.is_dir():
+        return [Finding(FAIL, f"{label} is a directory, not a file")]
+    size = path.stat().st_size
+    if size == 0:
+        return [Finding(FAIL, f"{label} is empty", apply_templates_fix("empty output"))]
+
+    text = read_text(path)
+    if PLACEHOLDER_RE.search(text):
+        return [Finding(FAIL, f"{label} still contains unrendered markers", apply_templates_fix("render output"))]
+    if not (HEX_RE.search(text) or RGB_RE.search(text)):
+        return [Finding(WARN, f"{label} contains no color values")]
+    return [Finding(OK, f"{label} ({size} B)")]
+
+
+def check_entry(entry: Entry, installed: Installed) -> list[Finding]:
+    data = entry.data
+    required = data.get("requires_path")
+    if required:
+        required_path = expand(required, entry.base)
+        if not required_path.exists():
+            return [Finding(SKIP, f"inactive: requires_path {display(required_path)} is missing")]
+
+    findings: list[Finding] = []
+
+    if data.get("input_path_dynamic"):
+        findings.append(Finding(SKIP, "input path is dynamic; source template cannot be checked"))
+    elif data.get("input_path"):
+        source = expand(data["input_path"], entry.base)
+        if not source.is_file():
+            findings.append(Finding(FAIL, f"source template missing: {display(source)}"))
+        elif source.stat().st_size == 0:
+            findings.append(Finding(FAIL, f"source template is empty: {display(source)}"))
+        else:
+            findings.append(Finding(OK, f"source {display(source)}"))
+
+    if data.get("output_path_dynamic"):
+        findings.append(Finding(SKIP, "output path is dynamic; rendered file cannot be checked"))
+        return findings
+
+    for output in output_paths(entry):
+        path = expand(output, NOCTALIA_CONFIG_DIR)
+        kind = output_kind(path)
+        if kind == "flatpak" and installed.flatpaks == []:
+            findings.append(Finding(SKIP, f"unused flatpak output {display(path)} (app not installed)"))
+            continue
+        if kind == "native" and installed.natives == [] and installed.flatpaks:
+            findings.append(Finding(SKIP, f"unused native output {display(path)} (Flatpak is the installed variant)"))
+            continue
+        findings.extend(check_output(path))
+
+    if not output_paths(entry):
+        findings.append(Finding(WARN, "no output_path declared"))
+
+    return findings
+
+
+def check_kitty() -> list[Finding]:
+    config = XDG_CONFIG / "kitty/kitty.conf"
+    if not config.is_file():
+        return [Finding(WARN, "kitty.conf not found; kitty has never been started")]
+    if any(re.match(r"^include\s+themes/noctalia\.conf$", line) for line in active_lines(config)):
+        return [Finding(OK, "kitty.conf includes themes/noctalia.conf")]
+    return [Finding(FAIL, "kitty.conf does not include themes/noctalia.conf", apply_templates_fix("kitty include"))]
+
+
+def check_alacritty() -> list[Finding]:
+    config = XDG_CONFIG / "alacritty/alacritty.toml"
+    if not config.is_file():
+        return [Finding(WARN, "alacritty.toml not found; alacritty has never been started")]
+    if any("noctalia.toml" in line for line in active_lines(config)):
+        return [Finding(OK, "alacritty.toml imports noctalia.toml")]
+    return [Finding(FAIL, "alacritty.toml does not import noctalia.toml", apply_templates_fix("alacritty import"))]
+
+
+def check_gtk(version: str) -> list[Finding]:
+    config = XDG_CONFIG / f"gtk-{version}.0/gtk.css"
+    if not config.is_file():
+        return [Finding(WARN, f"gtk-{version}.0/gtk.css not found")]
+    if re.search(r"@import\s+(?:url\()?[\"']?noctalia\.css", read_text(config)):
+        return [Finding(OK, f"gtk-{version}.0/gtk.css imports noctalia.css")]
+    return [Finding(FAIL, f"gtk-{version}.0/gtk.css does not import noctalia.css", apply_templates_fix("GTK import"))]
+
+
+def check_btop() -> list[Finding]:
+    config = XDG_CONFIG / "btop/btop.conf"
+    if not config.is_file():
+        fix = Fix("btop-config", "Create btop.conf from btop's default config and re-apply", "auto", btop_fix)
+        return [Finding(FAIL, "btop.conf not found; btop has never been started", fix)]
+    if any(re.match(r'^color_theme\s*=\s*"?noctalia"?\s*$', line) for line in active_lines(config)):
+        return [Finding(OK, "btop.conf selects color_theme noctalia")]
+    return [Finding(FAIL, 'btop.conf does not set color_theme = "noctalia"', apply_templates_fix("btop theme"))]
+
+
+def check_qt() -> list[Finding]:
+    findings: list[Finding] = []
+    for version in ("5", "6"):
+        config = XDG_CONFIG / f"qt{version}ct/qt{version}ct.conf"
+        if shutil.which(f"qt{version}ct") is None:
+            findings.append(Finding(SKIP, f"qt{version}ct is not installed; its scheme file is unused"))
+            continue
+        if not config.is_file():
+            findings.append(Finding(WARN, f"qt{version}ct.conf not found; qt{version}ct is not configured"))
+            continue
+        if any(re.search(r"^color_scheme_path\s*=.*noctalia", line) for line in active_lines(config)):
+            findings.append(Finding(OK, f"qt{version}ct uses the noctalia scheme"))
+        else:
+            fix = Fix(
+                f"qt{version}-scheme",
+                f"Select the noctalia scheme in qt{version}ct",
+                "manual",
+                instructions=f"Open qt{version}ct and choose the noctalia color scheme, then restart Qt apps.",
+            )
+            findings.append(Finding(WARN, f"qt{version}ct does not select the noctalia scheme", fix))
+    return findings
+
+
+def check_umbriel() -> list[Finding]:
+    config = XDG_CONFIG / "umbriel/config.toml"
+    if not config.is_file():
+        return [Finding(WARN, "umbriel/config.toml not found")]
+    if any(re.search(r"noctalia\.toml", line) for line in active_lines(config)):
+        return [Finding(OK, "umbriel config includes noctalia.toml")]
+    return [Finding(FAIL, "umbriel config does not include noctalia.toml", apply_templates_fix("Umbriel include"))]
+
+
+def check_kcolorscheme() -> list[Finding]:
+    config = XDG_CONFIG / "kdeglobals"
+    if not config.is_file():
+        return [Finding(WARN, "kdeglobals not found; no KDE application is configured yet")]
+    for line in active_lines(config):
+        if re.match(r"^ColorScheme\s*=\s*noctalia\s*$", line, re.IGNORECASE):
+            return [Finding(OK, "kdeglobals selects the noctalia color scheme")]
+    fix = Fix(
+        "kcolorscheme-select",
+        "Select the noctalia color scheme in KDE Settings",
+        "manual",
+        instructions="System Settings → Appearance → Colors → noctalia, then restart KDE apps.",
+    )
+    return [Finding(FAIL, "kdeglobals does not select ColorScheme=noctalia", fix)]
+
+
+def check_feishin() -> list[Finding]:
+    candidates = [
+        (HOME / ".var/app/org.jeffvli.feishin/config/feishin/config.json", "flatpak"),
+        (XDG_CONFIG / "feishin/config.json", "native"),
+    ]
+    for config, kind in candidates:
+        if not config.is_file():
+            continue
+        try:
+            data = json.loads(read_text(config))
+        except json.JSONDecodeError:
+            return [Finding(FAIL, f"{kind} Feishin config is not valid JSON: {display(config)}")]
+        if (data.get("css") or {}).get("enabled") is True:
+            return [Finding(OK, f"{kind} Feishin config enables custom CSS")]
+        fix = Fix(
+            f"feishin-css-{kind}",
+            f"Enable Custom CSS in the {kind} Feishin config",
+            "auto",
+            action=lambda config=config: feishin_fix(config),
+        )
+        return [Finding(FAIL, f"{kind} Feishin config has Custom CSS disabled", fix)]
+    return [Finding(WARN, "no Feishin config found; launch Feishin once and enable Custom CSS")]
+
+
+def zen_profiles() -> list[Path]:
+    roots = [
+        XDG_CONFIG / "zen",
+        HOME / ".zen",
+        HOME / ".var/app/app.zen_browser.zen/.zen",
+        HOME / ".var/app/app.zen_browser.zen/config/zen",
+    ]
+    profiles: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for prefs in root.glob("*/prefs.js"):
+            profiles.append(prefs.parent)
+    return profiles
+
+
+def check_zen() -> list[Finding]:
+    profiles = zen_profiles()
+    if not profiles:
+        fix = Fix(
+            "zen-profile",
+            "Launch Zen once to create a profile",
+            "manual",
+            instructions="Start Zen, close it, then run `noctalia-template-check --fix` again.",
+        )
+        return [Finding(WARN, "no Zen profile found", fix)]
+
+    findings: list[Finding] = []
+    cache_chrome = XDG_CACHE / "noctalia/zen-browser/zen-userChrome.css"
+    cache_content = XDG_CACHE / "noctalia/zen-browser/zen-userContent.css"
+    for profile in profiles:
+        chrome = profile / "chrome"
+        problems: list[str] = []
+
+        if not (chrome / "noctalia-userChrome.css").is_file():
+            problems.append("missing chrome/noctalia-userChrome.css")
+        if not (chrome / "noctalia-userContent.css").is_file():
+            problems.append("missing chrome/noctalia-userContent.css")
+
+        if not re.search(r"@import\s+(?:url\()?[\"']?noctalia-userChrome\.css", read_text(chrome / "userChrome.css")):
+            problems.append("userChrome.css does not import the Noctalia stylesheet")
+        if not re.search(r"@import\s+(?:url\()?[\"']?noctalia-userContent\.css", read_text(chrome / "userContent.css")):
+            problems.append("userContent.css does not import the Noctalia stylesheet")
+
+        js = read_text(profile / "user.js")
+        if "toolkit.legacyUserProfileCustomizations.stylesheets" not in js:
+            problems.append("user.js does not enable legacy stylesheets")
+        if "devtools.chrome.enabled" not in js:
+            problems.append("user.js does not enable chrome styles")
+
+        for cached, installed in (
+            (cache_chrome, chrome / "noctalia-userChrome.css"),
+            (cache_content, chrome / "noctalia-userContent.css"),
+        ):
+            if cached.is_file() and installed.is_file() and cached.read_bytes() != installed.read_bytes():
+                problems.append(f"{installed.name} is stale compared with the generated theme")
+
+        if problems:
+            fix = apply_templates_fix("Zen profile files")
+            findings.append(Finding(FAIL, f"profile {display(profile)}: " + "; ".join(problems), fix))
+        else:
+            findings.append(Finding(OK, f"profile {display(profile)} is wired up and current"))
+    return findings
+
+
+def check_fastfetch() -> list[Finding]:
+    config = XDG_CONFIG / "fastfetch/config.jsonc"
+    findings: list[Finding] = []
+    if not config.is_file():
+        fix = Fix(
+            "fastfetch-config",
+            "Generate a Fastfetch config",
+            "manual",
+            instructions="Run `fastfetch --gen-config` once (it is interactive), then re-run with --apply.",
+        )
+        findings.append(Finding(FAIL, "fastfetch config.jsonc not found", fix))
+    elif not re.search(r'"(?:logo|display)"\s*:', read_text(config)):
+        findings.append(Finding(WARN, "config.jsonc has no logo/display block yet; colors were not merged"))
+    else:
+        findings.append(Finding(OK, "config.jsonc contains the Noctalia logo/display colors"))
+    if shutil.which("jq") is None:
+        command = "sudo moss pkg add jq" if shutil.which("moss") else "install jq with your package manager"
+        fix = Fix(
+            "jq",
+            "Install jq",
+            "manual",
+            instructions=f"{command}, then re-run with --apply.",
+        )
+        findings.append(Finding(FAIL, "jq is not installed; the Fastfetch template hook requires it", fix))
+    return findings
+
+
+def check_luciole() -> list[Finding]:
+    if shutil.which("luciole") is None:
+        fix = Fix(
+            "luciole-install",
+            "Install Luciole or disable its template",
+            "manual",
+            instructions="Install Luciole, or disable the user template in Noctalia Settings → Templates.",
+        )
+        return [Finding(WARN, "luciole is not in PATH; the palette file is unused", fix)]
+    return [Finding(OK, "luciole is installed and reloads colors.toml automatically")]
+
+
+INTEGRATION_CHECKS: dict[str, Callable[[], list[Finding]]] = {
+    "kitty": check_kitty,
+    "alacritty": check_alacritty,
+    "gtk3": lambda: check_gtk("3"),
+    "gtk4": lambda: check_gtk("4"),
+    "btop": check_btop,
+    "qt": check_qt,
+    "umbriel": check_umbriel,
+    "kcolorscheme": check_kcolorscheme,
+    "feishin": check_feishin,
+    "zen-browser": check_zen,
+    "fastfetch": check_fastfetch,
+    "luciole": check_luciole,
+}
+
+
+# ---------------------------------------------------------------------------
+# scan and reporting
+
+
+def scan() -> tuple[list[GroupResult], list[Finding], OrderedDict[str, Fix], str]:
+    templates, source = load_templates()
+    entries, notices = build_entries(templates)
+
+    grouped: OrderedDict[tuple[str, str], list[Entry]] = OrderedDict()
+    for entry in entries:
+        grouped.setdefault((entry.origin, entry.group), []).append(entry)
+
+    results: list[GroupResult] = []
+    fixes: OrderedDict[str, Fix] = OrderedDict()
+    for (origin, group), group_entries in grouped.items():
+        installed = detect_installed(group, group_entries)
+        result = GroupResult(group, origin)
+        result.findings.append(installation_finding(installed, templates, group, origin))
+        for entry in group_entries:
+            result.names.append(entry.key)
+            result.findings.extend(check_entry(entry, installed))
+        checker = INTEGRATION_CHECKS.get(group)
+        app_absent = installed.known and not installed.natives and not installed.flatpaks
+        if checker is not None and not app_absent:
+            result.findings.extend(checker())
+        for finding in result.findings:
+            if finding.fix is not None:
+                fixes.setdefault(finding.fix.key, finding.fix)
+        results.append(result)
+
+    for notice in notices:
+        if notice.fix is not None:
+            fixes.setdefault(notice.fix.key, notice.fix)
+
+    return results, notices, fixes, source
+
+
+def marker(status: str, color: bool) -> str:
+    text = {OK: "ok  ", WARN: "warn", FAIL: "FAIL", SKIP: "skip"}[status]
+    if not color:
+        return f"[{text}]"
+    code = {OK: "32", WARN: "33", FAIL: "31", SKIP: "2"}[status]
+    return f"\033[{code}m[{text}]\033[0m"
+
+
+def print_report(results: list[GroupResult], notices: list[Finding], source: str, color: bool) -> dict[str, int]:
+    print(f"Noctalia template check ({source})")
+    print()
+
+    counts = {OK: 0, WARN: 0, FAIL: 0, SKIP: 0}
+    for result in results:
+        status = result.status
+        counts[status] += 1
+        title = result.group if result.origin == "builtin" else f"{result.group} ({result.origin})"
+        print(f"{marker(status, color)} {title}")
+        seen: set[tuple[str, str]] = set()
+        for finding in result.findings:
+            key = (finding.status, finding.message)
+            if key in seen:
+                continue
+            seen.add(key)
+            prefix = "" if finding.status == OK else f"{marker(finding.status, color)} "
+            print(f"        {prefix}{finding.message}")
+
+    if notices:
+        print()
+        for notice in notices:
+            counts[notice.status] += 1
+            print(f"{marker(notice.status, color)} {notice.message}")
+
+    return counts
+
+
+def print_fixes(fixes: OrderedDict[str, Fix]) -> None:
+    if not fixes:
+        print("\nNo fixes proposed.")
+        return
+    print("\nProposed fixes:")
+    for index, fix in enumerate(fixes.values(), start=1):
+        print(f"  {index}. [{fix.kind}] {fix.label}")
+        if fix.kind == "manual" and fix.instructions:
+            print(f"       {fix.instructions}")
+
+
+def choose_fixes(fixes: list[Fix]) -> list[Fix]:
+    if not sys.stdin.isatty():
+        print("\nNot a terminal; rerun with --fix-all to apply safe fixes.")
+        return []
+    choice = input("Apply [a]ll safe, numbers (e.g. 1,3), or [n]one: ").strip().lower()
+    if choice in ("", "n", "none", "q"):
+        return []
+    if choice in ("a", "all"):
+        return [fix for fix in fixes if fix.kind == "auto"]
+    selected: list[Fix] = []
+    for part in choice.replace(" ", "").split(","):
+        if not part.isdigit():
+            continue
+        index = int(part)
+        if 1 <= index <= len(fixes):
+            selected.append(fixes[index - 1])
+    return selected
+
+
+def apply_fixes(fixes: list[Fix]) -> int:
+    applied = 0
+    manual = 0
+    for fix in fixes:
+        if fix.kind == "manual":
+            print(f"[manual] {fix.label}")
+            if fix.instructions:
+                print(f"         {fix.instructions}")
+            manual += 1
+            continue
+        if fix.action is None:
+            continue
+        ok, message = fix.action()
+        print(f"[{'ok  ' if ok else 'FAIL'}] {fix.label}: {message}")
+        if ok:
+            applied += 1
+    if applied:
+        print("\nRe-scanning after fixes ...\n")
+        time.sleep(1.0)
+    elif manual:
+        print()
+    return applied
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Scan enabled Noctalia templates, verify native/Flatpak apps, and propose fixes."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--fix", action="store_true", help="choose fixes interactively")
+    group.add_argument("--fix-all", action="store_true", help="apply every safe fix")
+    parser.add_argument("--apply", action="store_true", help="re-render templates before scanning")
+    parser.add_argument("--verbose", action="store_true", help="show the config directory")
+    parser.add_argument("--no-color", action="store_true", help="disable colored markers")
+    args = parser.parse_args()
+
+    color = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+
+    if args.apply:
+        print("Re-rendering templates with `noctalia msg templates-apply` ...")
+        ok, message = run_templates_apply()
+        print(f"{'ok' if ok else 'FAIL'}: {message}")
+        if not ok:
+            return 2
+
+    if args.verbose:
+        print(f"Config directory: {display(NOCTALIA_CONFIG_DIR)}\n")
+
+    results, notices, fixes, source = scan()
+    if not results and not notices:
+        print("No enabled templates found.")
+        return 0
+
+    counts = print_report(results, notices, source, color)
+    print_fixes(fixes)
+
+    total = sum(counts.values())
+    print(
+        f"\nSummary: {total} template group(s) — "
+        f"{counts[OK]} ok, {counts[WARN]} warning(s), {counts[FAIL]} failed, {counts[SKIP]} skipped"
+    )
+
+    if not fixes:
+        return 1 if counts[FAIL] else 0
+
+    selected: list[Fix] = []
+    if args.fix_all:
+        selected = [fix for fix in fixes.values() if fix.kind == "auto"]
+    elif args.fix:
+        selected = choose_fixes(list(fixes.values()))
+
+    if not selected:
+        if not args.fix and not args.fix_all:
+            print("Run `noctalia-template-check --fix` to choose fixes.")
+        return 1 if counts[FAIL] else 0
+
+    apply_fixes(selected)
+
+    if any(fix.kind != "manual" for fix in selected):
+        results, notices, remaining, source = scan()
+        counts = print_report(results, notices, source, color)
+        if remaining:
+            print_fixes(remaining)
+        total = sum(counts.values())
+        print(
+            f"\nSummary after fixes: {total} template group(s) — "
+            f"{counts[OK]} ok, {counts[WARN]} warning(s), {counts[FAIL]} failed, {counts[SKIP]} skipped"
+        )
+        print("Restart apps that do not hot-reload (Zen, Feishin, btop, Qt apps).")
+
+    return 1 if counts[FAIL] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
